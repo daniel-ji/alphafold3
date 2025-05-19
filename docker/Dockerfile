@@ -1,6 +1,3 @@
-# Derived from the Dockerfile in the AlphaFold 3 repository, modified to install AlphaFold 3 on ARM architectures. 
-# The primary modification is building Triton from source, because the precompiled Triton wheels are not available for ARM architectures.
-
 # Copyright 2024 DeepMind Technologies Limited
 #
 # AlphaFold 3 source code is licensed under CC BY-NC-SA 4.0. To view a copy of
