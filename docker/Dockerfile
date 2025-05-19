@@ -1,3 +1,6 @@
+# Derived from the Dockerfile in the AlphaFold 3 repository, modified to install AlphaFold 3 on ARM architectures. 
+# The primary modification is building Triton from source, because the precompiled Triton wheels are not available for ARM architectures.
+
 # Copyright 2024 DeepMind Technologies Limited
 #
 # AlphaFold 3 source code is licensed under CC BY-NC-SA 4.0. To view a copy of
@@ -46,6 +49,22 @@ RUN mkdir /hmmer_build /hmmer ; \
 # Copy the AlphaFold 3 source code from the local machine to the container and
 # set the working directory to there.
 COPY . /app/alphafold
+
+# Install Triton 3.1.0 from source if not on x86_64 architecture.
+ARG TARGETARCH
+RUN if [ "$TARGETARCH" != "amd64" ]; then \
+    echo "Building Triton for non-x86_64 architecture: $TARGETARCH"; \
+    git clone https://github.com/triton-lang/triton.git /opt/triton && \
+    cd /opt/triton && \
+    git checkout release/3.1.x && \
+    pip3 install --upgrade pip && \
+    pip3 install ninja cmake wheel && \
+    cd /opt/triton/python && \
+    pip3 install -e . ; \
+else \
+    echo "Skipping Triton source installation for x86_64 architecture"; \
+fi
+
 WORKDIR /app/alphafold
 
 # Install the Python dependencies AlphaFold 3 needs.
