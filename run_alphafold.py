@@ -24,7 +24,6 @@ import csv
 import dataclasses
 import datetime
 import functools
-import multiprocessing
 import os
 import pathlib
 import shutil
@@ -178,18 +177,31 @@ _SEQRES_DATABASE_PATH = flags.DEFINE_string(
 # Number of CPUs to use for MSA tools.
 _JACKHMMER_N_CPU = flags.DEFINE_integer(
     'jackhmmer_n_cpu',
-    min(multiprocessing.cpu_count(), 8),
-    'Number of CPUs to use for Jackhmmer. Default to min(cpu_count, 8). Going'
-    ' beyond 8 CPUs provides very little additional speedup.',
+    # Unfortunately, os.process_cpu_count() is only available in Python 3.13+.
+    min(len(os.sched_getaffinity(0)), 8),
+    'Number of CPUs to use for Jackhmmer. Defaults to min(cpu_count, 8). Going'
+    ' above 8 CPUs provides very little additional speedup.',
+    lower_bound=0,
 )
 _NHMMER_N_CPU = flags.DEFINE_integer(
     'nhmmer_n_cpu',
-    min(multiprocessing.cpu_count(), 8),
-    'Number of CPUs to use for Nhmmer. Default to min(cpu_count, 8). Going'
-    ' beyond 8 CPUs provides very little additional speedup.',
+    # Unfortunately, os.process_cpu_count() is only available in Python 3.13+.
+    min(len(os.sched_getaffinity(0)), 8),
+    'Number of CPUs to use for Nhmmer. Defaults to min(cpu_count, 8). Going'
+    ' above 8 CPUs provides very little additional speedup.',
+    lower_bound=0,
 )
 
-# Template search configuration.
+# Data pipeline configuration.
+_RESOLVE_MSA_OVERLAPS = flags.DEFINE_bool(
+    'resolve_msa_overlaps',
+    True,
+    'Whether to deduplicate unpaired MSA against paired MSA. The default'
+    ' behaviour matches the method described in the AlphaFold 3 paper. Set this'
+    ' to false if providing custom paired MSA using the unpaired MSA field to'
+    ' keep it exactly as is as deduplication against the paired MSA could break'
+    ' the manually crafted pairing between MSA sequences.',
+)
 _MAX_TEMPLATE_DATE = flags.DEFINE_string(
     'max_template_date',
     '2021-09-30',  # By default, use the date from the AlphaFold 3 paper.
@@ -200,12 +212,12 @@ _MAX_TEMPLATE_DATE = flags.DEFINE_string(
     ' coordinates set. Only for components that have been released before this'
     ' date the model coordinates can be used as a fallback.',
 )
-
 _CONFORMER_MAX_ITERATIONS = flags.DEFINE_integer(
     'conformer_max_iterations',
     None,  # Default to RDKit default parameters value.
     'Optional override for maximum number of iterations to run for RDKit '
     'conformer search.',
+    lower_bound=0,
 )
 
 # JAX inference performance tuning.
@@ -217,9 +229,11 @@ _JAX_COMPILATION_CACHE_DIR = flags.DEFINE_string(
 _GPU_DEVICE = flags.DEFINE_integer(
     'gpu_device',
     0,
-    'Optional override for the GPU device to use for inference. Defaults to the'
-    ' 1st GPU on the system. Useful on multi-GPU systems to pin each run to a'
-    ' specific GPU.',
+    'Optional override for the GPU device to use for inference, uses zero-based'
+    ' indexing. Defaults to the 0th GPU on the system. Useful on multi-GPU'
+    ' systems to pin each run to a specific GPU. Note that if GPUs are already'
+    ' pre-filtered by the environment (e.g. by using CUDA_VISIBLE_DEVICES),'
+    ' this flag refers to the GPU index after the filtering has been done.',
 )
 _BUCKETS = flags.DEFINE_list(
     'buckets',
@@ -429,12 +443,13 @@ def predict_structure(
     buckets: Sequence[int] | None = None,
     ref_max_modified_date: datetime.date | None = None,
     conformer_max_iterations: int | None = None,
+    resolve_msa_overlaps: bool = True,
 ) -> Sequence[ResultsForSeed]:
   """Runs the full inference pipeline to predict structures for each seed."""
 
   print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
   featurisation_start_time = time.time()
-  ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+  ccd = chemical_components.Ccd(user_ccd=fold_input.user_ccd)
   featurised_examples = featurisation.featurise_input(
       fold_input=fold_input,
       buckets=buckets,
@@ -442,6 +457,7 @@ def predict_structure(
       verbose=True,
       ref_max_modified_date=ref_max_modified_date,
       conformer_max_iterations=conformer_max_iterations,
+      resolve_msa_overlaps=resolve_msa_overlaps,
   )
   print(
       f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
@@ -600,6 +616,7 @@ def process_fold_input(
     buckets: Sequence[int] | None = None,
     ref_max_modified_date: datetime.date | None = None,
     conformer_max_iterations: int | None = None,
+    resolve_msa_overlaps: bool = True,
     force_output_dir: bool = False,
 ) -> folding_input.Input:
   ...
@@ -614,6 +631,7 @@ def process_fold_input(
     buckets: Sequence[int] | None = None,
     ref_max_modified_date: datetime.date | None = None,
     conformer_max_iterations: int | None = None,
+    resolve_msa_overlaps: bool = True,
     force_output_dir: bool = False,
 ) -> Sequence[ResultsForSeed]:
   ...
@@ -627,6 +645,7 @@ def process_fold_input(
     buckets: Sequence[int] | None = None,
     ref_max_modified_date: datetime.date | None = None,
     conformer_max_iterations: int | None = None,
+    resolve_msa_overlaps: bool = True,
     force_output_dir: bool = False,
 ) -> folding_input.Input | Sequence[ResultsForSeed]:
   """Runs data pipeline and/or inference on a single fold input.
@@ -649,6 +668,11 @@ def process_fold_input(
       date the model coordinates can be used as a fallback.
     conformer_max_iterations: Optional override for maximum number of iterations
       to run for RDKit conformer search.
+    resolve_msa_overlaps: Whether to deduplicate unpaired MSA against paired
+      MSA. The default behaviour matches the method described in the AlphaFold 3
+      paper. Set this to false if providing custom paired MSA using the unpaired
+      MSA field to keep it exactly as is as deduplication against the paired MSA
+      could break the manually crafted pairing between MSA sequences.
     force_output_dir: If True, do not create a new output directory even if the
       existing one is non-empty. Instead use the existing output directory and
       potentially overwrite existing files. If False, create a new timestamped
@@ -702,6 +726,7 @@ def process_fold_input(
         buckets=buckets,
         ref_max_modified_date=ref_max_modified_date,
         conformer_max_iterations=conformer_max_iterations,
+        resolve_msa_overlaps=resolve_msa_overlaps,
     )
     print(f'Writing outputs with {len(fold_input.rng_seeds)} seed(s)...')
     write_outputs(
@@ -860,6 +885,7 @@ def main(_):
         buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
         ref_max_modified_date=max_template_date,
         conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
+        resolve_msa_overlaps=_RESOLVE_MSA_OVERLAPS.value,
         force_output_dir=_FORCE_OUTPUT_DIR.value,
     )
     num_fold_inputs += 1
